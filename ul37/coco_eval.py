@@ -64,7 +64,12 @@ def predict(variant: str, weights: Path, images: Path, ann_file: Path, output: P
                     {
                         "image_id": image_id,
                         "category_id": int(class_id),
-                        "bbox": [round(x1 * sx, 3), round(y1 * sy, 3), round((x2 - x1) * sx, 3), round((y2 - y1) * sy, 3)],
+                        "bbox": [
+                            round(x1 * sx, 3),
+                            round(y1 * sy, 3),
+                            round((x2 - x1) * sx, 3),
+                            round((y2 - y1) * sy, 3),
+                        ],
                         "score": round(float(score), 5),
                     }
                 )
