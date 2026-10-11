@@ -54,14 +54,27 @@ def split_images(root: Path, split: str) -> list[Path]:
 
 
 def save_predictions(model, images: list[Path], output: Path, batch_size: int) -> None:
-    """Save RF-DETR detections of dataset classes in the canonical Ultra Benchmark JSON shape."""
-    num_classes = model.model_config.num_classes
+    """Save RF-DETR detections of dataset classes in the canonical Ultra Benchmark JSON shape.
+
+    Images are resized with antialiasing before predict, as the torchvision training transforms do, because predict
+    resizes without it (roboflow/rf-detr#1516).
+    """
+    import torchvision.transforms.functional as F
+    from PIL import Image
+
+    num_classes, size = model.model_config.num_classes, model.model.resolution
     records = []
     for start in range(0, len(images), batch_size):
         batch = images[start : start + batch_size]
-        detections = model.predict([str(path) for path in batch], threshold=0.0, include_source_image=False)
-        for path, result in zip(batch, detections):
-            for (x1, y1, x2, y2), score, class_id in zip(result.xyxy.tolist(), result.confidence, result.class_id):
+        resized, scales = [], []
+        for path in batch:
+            tensor = F.to_tensor(Image.open(path).convert("RGB"))
+            resized.append(F.resize(tensor, [size, size], antialias=True).clamp(0, 1))
+            scales.append([tensor.shape[2] / size, tensor.shape[1] / size] * 2)
+        detections = model.predict(resized, threshold=0.0, include_source_image=False)
+        for path, scale, result in zip(batch, scales, detections):
+            boxes = (result.xyxy * scale).tolist()
+            for (x1, y1, x2, y2), score, class_id in zip(boxes, result.confidence, result.class_id):
                 if class_id >= num_classes:  # extra no-object head slot, never a dataset class
                     continue
                 records.append(
