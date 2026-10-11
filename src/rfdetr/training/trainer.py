@@ -984,7 +984,7 @@ def build_trainer(
         "enable_progress_bar": tc.progress_bar is not None,
         "default_root_dir": tc.output_dir,
         "log_every_n_steps": 50,
-        "deterministic": False,
+        "deterministic": "warn",
         "check_val_every_n_epoch": tc.eval_interval,
         "num_sanity_val_steps": tc.num_sanity_val_steps,
     }
