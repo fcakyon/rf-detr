@@ -10,6 +10,10 @@ already 91-space COCO category ids. Score evaluates that json with faster-coco-e
 every given annotation file, which must share the image ids and categories of the first one, and prints one SCORE line
 with AP, AP50, APs, APm and APl as percentages.
 
+`--engine` replaces the PyTorch forward with a static batch-1 TensorRT engine of the checkpoint, run with
+`--batch 1`. Everything else stays, so its SCORE line, which then hashes the engine, compares directly with the
+FP32 one.
+
 Usage:
     CUDA_VISIBLE_DEVICES=0 python ul37/coco_eval.py nano rf-detr-nano.pth --images coco/val2017 --name rfdetr-n \
         --output out --ann coco=coco/annotations/instances_val2017.json
@@ -32,7 +36,9 @@ VARIANTS = {
 }
 
 
-def predict(variant: str, weights: Path, images: Path, ann_file: Path, output: Path, batch: int) -> None:
+def predict(
+    variant: str, weights: Path, images: Path, ann_file: Path, output: Path, batch: int, engine: Path | None = None
+) -> None:
     """Write the COCO results json of an RF-DETR checkpoint on every image of one annotation file.
 
     Args:
@@ -42,6 +48,7 @@ def predict(variant: str, weights: Path, images: Path, ann_file: Path, output: P
         ann_file (Path): COCO annotation json whose images are evaluated.
         output (Path): Results json to write.
         batch (int): Images per predict call.
+        engine (Path | None): Static batch-1 TensorRT engine of the checkpoint to run instead of PyTorch.
     """
     import rfdetr
     import torchvision.transforms.functional as F
@@ -50,6 +57,28 @@ def predict(variant: str, weights: Path, images: Path, ann_file: Path, output: P
     model = getattr(rfdetr, VARIANTS[variant])(pretrain_weights=str(weights))
     assert model.model_config.num_select == 300, model.model_config.num_select
     size = model.model.resolution
+    if engine:  # same preprocessing and postprocessor around the engine, which carries an Ultralytics metadata header
+        import tensorrt as trt
+        import torch
+
+        data = engine.read_bytes()
+        runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        context = runtime.deserialize_cuda_engine(
+            data[4 + int.from_bytes(data[:4], "little") :]
+        ).create_execution_context()
+        io = {}
+        for name in map(context.engine.get_tensor_name, range(context.engine.num_io_tensors)):
+            dtype = getattr(torch, trt.nptype(context.engine.get_tensor_dtype(name)).__name__)
+            io[name] = torch.empty(tuple(context.engine.get_tensor_shape(name)), dtype=dtype, device="cuda")
+            context.set_tensor_address(name, io[name].data_ptr())
+
+        class Engine(torch.nn.Module):  # predict() calls model.model.model as a module
+            def forward(self, images):
+                io["images"].copy_(images)
+                context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+                return io["dets"], io["labels"]
+
+        model.model.model = Engine()
     files = [(image["id"], images / image["file_name"]) for image in json.loads(ann_file.read_text())["images"]]
     records = []
     for start in range(0, len(files), batch):
@@ -112,13 +141,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True, help="directory for the results json")
     parser.add_argument("--name", required=True, help="model name for the results file and SCORE line")
     parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--engine", type=Path, help="TensorRT engine of the checkpoint to score, with --batch 1")
     args = parser.parse_args()
 
     anns = {name: Path(path) for name, path in (item.split("=", 1) for item in args.ann)}
     args.output.mkdir(parents=True, exist_ok=True)
     results = args.output / f"{args.name}.json"
-    predict(args.variant, args.weights, args.images, next(iter(anns.values())), results, args.batch)
-    sha = hashlib.sha256(args.weights.read_bytes()).hexdigest()[:8]
+    predict(args.variant, args.weights, args.images, next(iter(anns.values())), results, args.batch, args.engine)
+    sha = hashlib.sha256((args.engine or args.weights).read_bytes()).hexdigest()[:8]
     print("SCORE", json.dumps({"model": args.name, "sha256": sha, **score(results, anns)}), flush=True)
 
 
