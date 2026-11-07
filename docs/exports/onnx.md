@@ -4,7 +4,22 @@ description: Run inference with exported RF-DETR ONNX models using ONNX Runtime.
 
 # ONNX Inference
 
-The exported graph returns **raw** tensors — `dets` (`pred_boxes`, normalized `cxcywh`) and `labels` (`pred_logits`, un-activated). Nothing is decoded inside the graph, so your inference code must apply sigmoid, exclude the checkpoint's background slot when it has one, and convert box format yourself.
+For the common prediction API, load the ONNX file with `RFDETRInference`. The exported graph itself returns raw tensors; the advanced ONNX Runtime example below shows how to run and decode those tensors directly.
+
+## Predict with RFDETRInference
+
+```python
+from rfdetr import RFDETRInference
+
+model = RFDETRInference("output/inference_model.onnx")
+detections = model.predict("image.jpg", threshold=0.5)
+```
+
+This returns `supervision.Detections` for detection and segmentation models, or `supervision.KeyPoints` for keypoint models. See [Predict with RFDETRInference](basics.md#predict-with-rfdetrinference) for checkpoint inputs, metadata, batch behavior, and runtime settings.
+
+## Advanced: Run ONNX Runtime directly
+
+The exported graph returns **raw** tensors — `dets` (`pred_boxes`, normalized `cxcywh`) and `labels` (`pred_logits`, un-activated). The code below shows direct ONNX Runtime execution and NumPy decoding for low-level inspection. The private `_run_inference` helper remains a dependency-light numerical reference and shares raw execution with the `RFDETRInference` adapter; use `RFDETRInference` for normal image prediction.
 
 !!! warning "Match outputs by name, not by shape"
 
@@ -85,3 +100,52 @@ boxes, labels, confidences = xyxy, class_ids[keep], scores[keep]
 ```
 
 For a fuller reference implementation (name-based matching with a documented shape-based fallback), see `_run_inference` in [`src/rfdetr/export/_onnx/inference.py`](https://github.com/roboflow/rf-detr/blob/develop/src/rfdetr/export/_onnx/inference.py).
+
+## INT8 Quantization
+
+`quantization="int8"` writes a static INT8 model — 8-bit weights *and* activations — beside the FP32 graph it was derived from:
+
+```python
+from rfdetr import RFDETRSmall
+
+model = RFDETRSmall()
+model.export(format="onnx", quantization="int8", calibration_data="calibration_images/")
+# output/inference_model.onnx        (FP32, the source)
+# output/inference_model_int8.onnx   (INT8, ~3x smaller)
+```
+
+`calibration_data` is **required** and must be representative of your deployment domain. Static quantization reads activation ranges from that data; out-of-domain or synthetic images produce a model that loads, runs, and is quietly wrong. Accepted forms are a directory of images (preprocessed exactly as `predict()` does, capped by `max_images`), a `.npy` file of shape `(N, C, H, W)` already normalized, or an equivalent array. A few dozen to a few hundred images from your validation split is the normal choice.
+
+!!! warning "What gets quantized, and why it is not everything"
+
+    Only `MatMul` and `Gemm` run in 8-bit. Attention-score multiplies, the detection heads, normalization, softmax and the surrounding elementwise math stay in float, and those ops' *outputs* are not quantized either.
+
+    This is not conservatism. Measured on a 500-image COCO val2017 subset, ONNX Runtime's default op coverage — which quantizes `LayerNormalization`, `Mul`, `Div`, `Reshape` and every shape op as well — costs **9.65 mAP on Nano and 12.14 on Small**. Restricting to the matrix multiplies brings that back to **2.65 and 2.67**. It is also *faster*: the Q/DQ conversions around non-matmul ops cost more than the 8-bit kernels save, so quantizing less wins on both axes.
+
+!!! note "Expect a measurable accuracy cost"
+
+    On the same subset, INT8 cost 2.65 mAP (Nano) and 2.67 (Small) against each model's own FP32 baseline, for roughly 3x smaller files and ~1.4x faster CPU inference at batch 1. That is a real trade, not a rounding error — **measure on your own data and task before deploying**. Published INT8 RF-DETR models built with other tooling land closer to 0.5 mAP, so this gap is a property of the current configuration rather than of the architecture.
+
+Quantization runs on CPU via ONNX Runtime, which the `rfdetr[onnx]` extra already installs.
+
+The x86 CPU timing and accuracy comparison against the fp32 model is pending a rerun of the [CPU cookbook](../../cookbooks/export-cpu/); see [On an x86 CPU](#on-an-x86-cpu) below.
+
+## Measured Latency
+
+Every latency is the end-to-end `predict()` call (preprocessing, forward, postprocessing) through `RFDETRInference`, `RFDETRSmall`. `FPS` is images per second. `mAP@50:95` is a seeded 500-image COCO val2017 subset, scored at batch 1 on the same artifact that was timed. The PyTorch baseline of each machine is on the [export overview](index.md#pytorch-baseline).
+
+### On an NVIDIA L4
+
+Colab NVIDIA L4, `rfdetr` 1.12.0.dev0, CUDA execution provider, 20 warmup + 100 timed runs per row, from the [CUDA cookbook](../../cookbooks/export-cuda/). On this provider `RFDETRInference` prepares each batch on the GPU and hands it to ONNX Runtime through IO binding, so the input never returns to the host.
+
+| Runtime | Precision | Batch | end2end [ms] | FPS [img/s] | mAP@50:95 [%] | Size [MB] |
+| ------- | --------- | ----- | ------------ | ----------- | ------------- | --------- |
+| CUDA EP | fp32      | 1     | 8.4          | 119.2       | 56.5          | 127.5     |
+| CUDA EP | fp32      | 4     | 30.1         | 132.9       | —             | 127.5     |
+| CUDA EP | fp32      | 8     | 66.4         | 120.5       | —             | 127.5     |
+
+ONNX Runtime on CUDA scales little with batch: batch 8 is slower per image than batch 4 (120.5 against 132.9 img/s). The batch 4 and 8 latencies are batch size divided by the measured img/s, rounded to one decimal. On this GPU a [TensorRT engine](tensorrt.md#latency-across-nvidia-gpus) is the faster route.
+
+### On an x86 CPU
+
+No x86 CPU table is published yet: the earlier run had `RFDETRInference`'s ONNX loader 39% slower than the same model through another package on the same ONNX Runtime, a gap that was never explained, so its rows are removed pending a rerun of the [CPU cookbook](../../cookbooks/export-cpu/). On Intel CPUs, [OpenVINO](openvino.md#measured-latency-on-an-x86-cpu) is the measured route.

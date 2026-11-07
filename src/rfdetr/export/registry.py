@@ -15,14 +15,20 @@ exporter class and the configuration dataclass it is built from.
 from __future__ import annotations
 
 import importlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 from rfdetr.utilities.logger import get_logger
 
 if TYPE_CHECKING:
+    from rfdetr.export._runtime.adapters import ExportRuntime
+    from rfdetr.export._runtime.metadata import ExportMetadata
     from rfdetr.export.base import Exporter
+
+#: ``load_export_runtime(path, metadata, device, options)``: *options* is ``RFDETRInference(runtime_options=...)``.
+RuntimeLoader = Callable[[Path, "ExportMetadata", str, Mapping[str, Any]], "ExportRuntime"]
 
 logger = get_logger()
 
@@ -49,6 +55,7 @@ class ExporterEntry:
         preimport: ``"module:function"`` to call before importing *module*, or ``None``. TFLite needs one: TensorFlow
             has to be loaded before anything pulls in ONNX's C extension, and importing the exporter's own package
             already reaches third-party code that could load ONNX first.
+        suffixes: Lowercase file suffixes the format's artifact may carry; empty means unchecked.
     """
 
     module: str
@@ -58,11 +65,19 @@ class ExporterEntry:
     supports_dynamic_batch: bool = False
     dynamic_batch_reason: str = ""
     preimport: str | None = None
+    suffixes: frozenset[str] = frozenset()
 
 
 #: Every format :meth:`rfdetr.detr.RFDETR.export` accepts, mapped to the exporter that writes it.
 REGISTRY: Mapping[str, ExporterEntry] = {
-    "onnx": ExporterEntry("rfdetr.export._onnx.exporter", "OnnxExporter", "onnx", "ONNX", supports_dynamic_batch=True),
+    "onnx": ExporterEntry(
+        "rfdetr.export._onnx.exporter",
+        "OnnxExporter",
+        "onnx",
+        "ONNX",
+        supports_dynamic_batch=True,
+        suffixes=frozenset({".onnx"}),
+    ),
     "tflite": ExporterEntry(
         "rfdetr.export._tflite.exporter",
         "TFLiteExporter",
@@ -74,6 +89,7 @@ REGISTRY: Mapping[str, ExporterEntry] = {
             " Export one .tflite per batch size instead."
         ),
         preimport="rfdetr.export._backend:preload_tensorflow_before_onnx",
+        suffixes=frozenset({".tflite"}),
     ),
     "tensorrt": ExporterEntry(
         "rfdetr.export._tensorrt.exporter",
@@ -88,6 +104,7 @@ REGISTRY: Mapping[str, ExporterEntry] = {
         "executorch",
         "ExecuTorch",
         dynamic_batch_reason="(see the ExecuTorch exporter for details). Export one .pte per batch size instead.",
+        suffixes=frozenset({".pte"}),
     ),
     "coreml": ExporterEntry(
         "rfdetr.export._coreml.exporter",
@@ -98,6 +115,7 @@ REGISTRY: Mapping[str, ExporterEntry] = {
             "(fixed shapes are required for reliable ANE / GPU scheduling)."
             " Export one .mlpackage per batch size instead."
         ),
+        suffixes=frozenset({".mlpackage", ".mlmodel"}),
     ),
     "coreai": ExporterEntry(
         "rfdetr.export._coreai.exporter",
@@ -105,13 +123,15 @@ REGISTRY: Mapping[str, ExporterEntry] = {
         "coreai",
         "Core AI",
         dynamic_batch_reason="(the asset bakes a fixed input shape). Export one .aimodel per batch size instead.",
+        suffixes=frozenset({".aimodel"}),
     ),
     "openvino": ExporterEntry(
         "rfdetr.export._openvino.exporter",
         "OpenVINOExporter",
         "openvino",
         "OpenVINO",
-        dynamic_batch_reason="(the IR graph bakes a fixed input shape). Export one model per batch size instead.",
+        dynamic_batch_reason="(omit dynamic_batch; the converted OpenVINO IR already accepts any batch size).",
+        suffixes=frozenset({".xml"}),
     ),
     "litert": ExporterEntry(
         "rfdetr.export._litert.exporter",
@@ -119,29 +139,68 @@ REGISTRY: Mapping[str, ExporterEntry] = {
         "litert",
         "LiteRT",
         dynamic_batch_reason="(the .tflite bakes a fixed input shape). Export one model per batch size instead.",
+        suffixes=frozenset({".tflite"}),
     ),
 }
 
 #: Short spellings accepted for a format, mapped to the canonical name.
 ALIASES: Mapping[str, str] = {"trt": "tensorrt", "pte": "executorch"}
 
+#: Format-owned runtime loaders. Import a loader only when its artifact is opened.
+RUNTIME_LOADERS: Mapping[str, str] = {
+    "onnx": "rfdetr.export._onnx.inference:load_export_runtime",
+    "tflite": "rfdetr.export._tflite.inference:load_export_runtime",
+    "litert": "rfdetr.export._tflite.inference:load_export_runtime",
+    "tensorrt": "rfdetr.export._tensorrt.inference:load_export_runtime",
+    "openvino": "rfdetr.export._openvino.inference:load_export_runtime",
+    "coreml": "rfdetr.export._coreml.inference:load_export_runtime",
+    "coreai": "rfdetr.export._coreai.inference:load_export_runtime",
+    "executorch": "rfdetr.export._executorch.inference:load_export_runtime",
+}
+
+
+def resolve_runtime_loader(format: str) -> RuntimeLoader:
+    """Import the loader for one exported artifact format.
+
+    Args:
+        format: Canonical export format name.
+
+    Returns:
+        The runtime loader registered for the format.
+
+    Raises:
+        ValueError: If the format is not a known export format.
+    """
+    target = RUNTIME_LOADERS.get(format)
+    if target is None:
+        raise ValueError(f"Unsupported export format {format!r}.")
+    module_name, _, attribute = target.partition(":")
+    return cast(RuntimeLoader, getattr(importlib.import_module(module_name), attribute))
+
 
 def normalize_format(format: str) -> str:
-    """Resolve an alias to the canonical format name.
+    """Resolve a format name or alias, in any case, to the canonical format name.
 
     Args:
         format: Format name or alias as the caller spelled it.
 
     Returns:
-        The canonical format name, unchanged when *format* is already canonical.
+        The canonical format name. An unknown name, or a non-string value, comes back unchanged, so the error that
+        rejects it names it as the caller passed it.
 
     Examples:
         >>> normalize_format("trt")
         'tensorrt'
-        >>> normalize_format("onnx")
+        >>> normalize_format("ONNX")
         'onnx'
+        >>> normalize_format("NoneSuch")
+        'NoneSuch'
     """
-    return ALIASES.get(format, format)
+    if not isinstance(format, str):
+        return format
+    name = format.lower()
+    canonical = ALIASES.get(name, name)
+    return canonical if canonical in REGISTRY else format
 
 
 def resolve_exporter(format: str) -> type[Exporter[Any]]:
@@ -200,7 +259,7 @@ def require_entry(format: str) -> ExporterEntry:
         >>> require_entry("tensorrt").label
         'TensorRT'
     """
-    entry = REGISTRY.get(format)
+    entry = REGISTRY.get(format) if isinstance(format, str) else None
     if entry is None:
         raise ValueError(f"Unsupported export format {format!r}. Choose from: {sorted(REGISTRY)}.")
     return entry

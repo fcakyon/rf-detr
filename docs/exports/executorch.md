@@ -26,6 +26,8 @@ pip install "rfdetr[executorch]"
 
 The `"xnnpack"` backend targets any CPU platform and runs in fp32. It is the recommended, portable backend and requires only the standard `rfdetr[executorch]` wheel. `backend` has no default — it must always be passed explicitly for `format="executorch"`.
 
+On this backend the export rewrites attention without a mask as two batched matrix multiplications and a softmax, and computes the query, key and value slices of the decoder's packed `in_proj_weight` at export time. XNNPACK then runs the encoder and decoder attention, which `F.scaled_dot_product_attention` and `nn.MultiheadAttention` otherwise split into portable kernels between many small XNNPACK partitions. The outputs are the same to float32 rounding, and the median CPU latency is 33–54% lower (1.5–2.2x faster) in the measurements of the changelog entry for this change (ExecuTorch 1.5.1, 16 threads, Xeon and Apple M4 Max).
+
 === "Object Detection"
 
     ```python
@@ -70,11 +72,11 @@ model.export(format="executorch", backend="coreml")
 
 RF-DETR's graph lowers to a **single** CoreML delegate — no operator is left behind on ExecuTorch's portable CPU kernels — so the `.pte` carries one Core ML model, and the Neural Engine is reachable through it. The compute units are not baked in; the app that loads the `.pte` chooses them, exactly as for a native `.mlpackage`.
 
-Measured on a pretrained `RFDETRNano` (Apple M3 Pro, macOS 27.0, COCO val2017, all 5000 images), this delegate keeps more accuracy than a native fp16 `.mlpackage`: 48.0 mAP against 45.1, at 14.0 ms against 20.8 ms. Both run their arithmetic in fp16, but the native export also stores the weights in fp16, and that is what costs the accuracy.
+Measured on a pretrained `RFDETRNano` (Apple M3 Pro, macOS 27.0.1, COCO val2017, all 5000 images), this delegate scores 48.0 mAP, the same as eager PyTorch and as a native fp16 `.mlpackage`. Both are iOS 15 (specification 6) Core ML programs holding fp16 weights, so the resample ops stay off the Neural Engine in each. The delegate does reach the Neural Engine, but its op split cannot be measured, because `MLComputePlan` needs an `.mlpackage` (see [Native CoreML Export](coreml.md#neural-engine-compute-units-and-the-fallback-boundary)).
 
 !!! note
 
-    CoreML export uses fp16 arithmetic. Top-level detections (bounding boxes and class labels) are correct, but raw tensor values will differ from the PyTorch fp32 baseline — at the fp16 precision level, and through the two-stage query ranking described under [Native CoreML Export](coreml.md#neural-engine-compute-units-and-the-fallback-boundary), which fp16 makes more likely to diverge rather than less. For what fp16 costs in mAP, and for how Core ML splits the model across the ANE, GPU and CPU, see [Neural Engine, compute units, and the fallback boundary](coreml.md#neural-engine-compute-units-and-the-fallback-boundary).
+    CoreML export uses fp16 arithmetic. Top-level detections (bounding boxes and class labels) are correct, but raw tensor values will differ from the PyTorch fp32 baseline — at the fp16 precision level, and through the two-stage query ranking described under [Native CoreML Export](coreml.md#neural-engine-compute-units-and-the-fallback-boundary), which fp16 makes more likely to diverge rather than less. For how Core ML splits the model across the ANE, GPU and CPU, see [Neural Engine, compute units, and the fallback boundary](coreml.md#neural-engine-compute-units-and-the-fallback-boundary).
 
 ## QNN Backend (Qualcomm Snapdragon HTP, fp16)
 
@@ -99,7 +101,32 @@ The `soc` parameter is required for QNN and must be a `QcomChipset` name matchin
 - **`dynamic_batch=True` is not supported.** The ExecuTorch runtime cannot resize RF-DETR's windowed-attention reshapes for a variable batch size. Export one `.pte` file per batch size instead (e.g. `batch_size=1` for single-image inference).
 - **QNN requires a source build.** The QNN backend is not available via the pip wheel; see the ExecuTorch documentation for source-build instructions against the QAIRT SDK.
 
-## ExecuTorch Inference Example
+## Measured Latency on a Laptop CPU
+
+No latency table is published for this format yet. The earlier rows were measured before the cookbook pinned one thread count for every runtime, so they were not comparable across runtimes and have been removed pending a rerun of the [mobile cookbook](../../cookbooks/export-mobile/).
+
+## Measured Latency on Apple Silicon
+
+CoreML backend, Apple M4 Max, macOS 26.7.1, `RFDETRSmall`, 5 warmup + 30 timed runs per row, from the [Apple cookbook](../../cookbooks/export-apple/). Every latency is the end-to-end `predict()` call through `RFDETRInference`; `FPS` is images per second at that batch size. `mAP@50:95` is a seeded 500-image COCO val2017 subset, scored on the same batch-1 artifact that was timed. The backend exports fp16 only.
+
+| Backend | Precision | b1 latency [ms] | Size [MB] | mAP@50:95 [%] | FPS b1 | FPS b4 | FPS b8 |
+| ------- | --------- | --------------- | --------- | ------------- | ------ | ------ | ------ |
+| CoreML  | fp16      | 24.4            | 58.2      | 56.5          | 41.0   | 49.1   | 83.0   |
+
+It matches [native CoreML fp16](coreml.md#measured-latency-on-apple-silicon) at batch 1 (24.4 ms) and is slower than native CoreML fp32 (12.7 ms). Another job ran on the machine during this measurement, so the batch-8 deviation is large (± 16.3 ms).
+
+## Predict with RFDETRInference
+
+```python
+from rfdetr import RFDETRInference
+
+model = RFDETRInference("output/rfdetr-medium_xnnpack.pte")
+detections = model.predict("image.jpg", threshold=0.5)
+```
+
+This loads the `.pte` with ExecuTorch and returns the shared Supervision result types. See [Predict with RFDETRInference](basics.md#predict-with-rfdetrinference) for checkpoint inputs, metadata, and batch behavior.
+
+## Advanced: Use the ExecuTorch runtime directly
 
 !!! warning "torch/executorch ABI compatibility"
 

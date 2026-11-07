@@ -30,9 +30,22 @@ model.export(format="coreai")
 
 This produces `output/rfdetr-nano_fp32.aimodel`. Segmentation and keypoint models export the same way. Pass `coreai_precision="float16"` for a half-size `rfdetr-nano_fp16.aimodel` whose input and outputs are float16 as well.
 
-The asset keeps the contract of the other formats: one fixed `[batch, 3, H, W]` input, resized without antialiasing and ImageNet-normalized, as in the [ONNX Inference](onnx.md) example. Unlike CoreML, the tensors keep their names — `input`, then `dets` and `labels`, plus `masks` or `keypoints` — and any `notes` are stored in the asset metadata under `rfdetr_notes`.
+The asset keeps the contract of the other formats: one fixed `[batch, 3, H, W]` input, resized without antialiasing and ImageNet-normalized, as in the [ONNX Inference](onnx.md) example. Unlike CoreML, the tensors keep their names — `input`, then `dets` and `labels`, plus `masks` or `keypoints`. Any `notes` are stored in the asset metadata under `rfdetr_notes`, as described in [Read Embedded Notes](advanced.md#read-embedded-notes).
 
-## Core AI Inference Example
+## Predict with RFDETRInference
+
+```python
+from rfdetr import RFDETRInference
+
+model = RFDETRInference("output/rfdetr-nano_fp32.aimodel")
+detections = model.predict("image.jpg", threshold=0.5)
+```
+
+This returns the shared Supervision result types. See [Predict with RFDETRInference](basics.md#predict-with-rfdetrinference) for checkpoint inputs, metadata, and batch behavior.
+
+## Advanced: Use Core AI directly
+
+The shared `RFDETRInference` loader also uses Core AI's vendor runtime API directly; this example shows that API for callers who need raw outputs.
 
 === "Python"
 
@@ -93,7 +106,7 @@ The first load compiles the asset for the Neural Engine (5 to 9 s on these devic
 
 !!! warning "Keypoint models: do not run float16 on the Neural Engine"
 
-    A float16 `RFDETRKeypointPreview` `.aimodel` terminates the process when Core AI runs it on the Neural Engine: the first inference aborts inside MPSGraph (`ANERegion.mm:414: ANE inference operation failed`), and no error reaches the caller. iOS and iPadOS choose the Neural Engine for float16 by default. Measured on macOS 27.0 (26A428), M5 Pro, with a Neural Engine preference; the same asset is correct with `SpecializationOptions.cpu_only()` or a GPU preference, and float32 is correct on every compute unit. Export keypoint models in float32, which is the default.
+    A float16 `RFDETRKeypointPreview` `.aimodel` terminates the process when Core AI runs it on the Neural Engine: the first inference aborts inside MPSGraph (`ANERegion.mm:414: ANE inference operation failed`), and no error reaches the caller. iOS and iPadOS choose the Neural Engine for float16 by default. Measured on macOS 27.0 (26A428), M5 Pro, with a Neural Engine preference; the same asset is correct with `SpecializationOptions.cpu_only()` or a GPU preference, and float32 is correct on every compute unit. Export keypoint models in float32, which is the default; a float16 keypoint export warns.
 
 ## How the Conversion Works
 

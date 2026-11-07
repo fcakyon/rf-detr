@@ -16,9 +16,11 @@
 
 ---
 
-RF-DETR is a real-time transformer architecture for object detection, instance segmentation, and keypoint detection (preview) developed by Roboflow. Built on a DINOv2 vision transformer backbone, RF-DETR delivers state-of-the-art accuracy and latency trade-offs on [Microsoft COCO](https://cocodataset.org/#home) and [RF100-VL](https://github.com/roboflow/rf100-vl).
+RF-DETR is a real-time transformer architecture for object detection, instance segmentation, and keypoint detection (preview) developed by Roboflow. Built on a DINOv2 vision transformer backbone (a PE-Core-T backbone for Atto, Femto and Pico), RF-DETR delivers state-of-the-art accuracy and latency trade-offs on [Microsoft COCO](https://cocodataset.org/#home) and [RF100-VL](https://github.com/roboflow/rf100-vl).
 
-RF-DETR uses a DINOv2 vision transformer backbone and supports object detection, instance segmentation, and keypoint detection (preview) in a single, consistent API. The open-source `rfdetr` package and Apache-designated models are released under Apache 2.0, while Plus components (`rfdetr_plus`, including RF-DETR-XL/2XL detection models) are licensed under PML 1.0.
+RF-DETR supports object detection, instance segmentation, and keypoint detection (preview) in a single, consistent API.
+
+**Commercially usable under Apache 2.0.** The `rfdetr` package, RF-DETR Nano, Small, Medium and Large detection, every RF-DETR-Seg size (Nano through 2XLarge), and RF-DETR Keypoint are released under the Apache 2.0 license, so they're commercially usable out of the box: you can ship them in closed-source, commercial products, including self-hosted deployments, without paying a license fee or open-sourcing your code. RF-DETR Atto, Femto, Pico, XL and 2XL detection ship in the optional `rfdetr[plus]` extension under the [Roboflow Platform Model License (PML 1.0)](https://github.com/roboflow/rf-detr_plus/blob/main/LICENSE): commercial use is included when you deploy on Roboflow, and commercial self-hosting requires the Enterprise add-on. See [License](#license).
 
 The published RF-DETR sizes were created with neural architecture search (NAS) — and the same NAS method is now available on the [Roboflow platform](https://app.roboflow.com/), so you can discover the best architecture for your own dataset. Learn more in the [NAS docs](https://docs.roboflow.com/train/neural-architecture-search).
 
@@ -31,6 +33,8 @@ To install RF-DETR, install the `rfdetr` package in a [**Python>=3.10**](https:/
 ```bash
 pip install rfdetr
 ```
+
+`pip install rfdetr` gives you only Apache 2.0 RF-DETR code and models, so it's commercially usable out of the box. `pip install "rfdetr[plus]"` adds the Atto, Femto, Pico, XL and 2XL detection models under PML 1.0 (commercial use included on Roboflow; commercial self-hosting requires the Enterprise add-on). See [License](#license).
 
 <details>
 <summary>Install from source</summary>
@@ -49,6 +53,8 @@ pip install https://github.com/roboflow/rf-detr/archive/refs/heads/develop.zip
 
 RF-DETR achieves state-of-the-art results in both object detection and instance segmentation, with benchmarks reported on Microsoft COCO and RF100-VL (RF100-VL for detection only). The charts and tables below compare RF-DETR against other top real-time models across accuracy and latency for detection and segmentation. All COCO accuracy numbers are measured in-house for every model shown, computed with pycocotools in SAB over the full 5,000-image `val2017` split, so every row is directly comparable and may differ from vendor-reported figures. The sole exception is rows marked †, which are quoted from the original authors' paper and were not measured in SAB. All latency numbers were measured on an NVIDIA T4 using TensorRT, FP16, and batch size 1. Parameter counts are deployment (fused) `nn.Module` parameter counts (`model.parameters()`, not the raw tensor count of the saved checkpoint), except rows marked †, which are the authors' reported counts. For full benchmarking methodology and reproducibility details, see [roboflow/sab](https://github.com/roboflow/single_artifact_benchmarking).
 
+> **License note:** YOLOv8, YOLO11 and YOLO26 are released under AGPL-3.0. In practice, using them in a commercial product or service, including one users reach over a network, means open-sourcing your application code under AGPL-3.0 or buying a commercial license. Deploying on Roboflow includes a commercial license for these models for every user; commercial self-hosting is an Enterprise add-on ([details](https://roboflow.com/ultralytics)). RF-DETR rows marked Apache 2.0 are commercially usable out of the box; rows marked PML 1.0 include commercial use on Roboflow, and commercial self-hosting requires the Enterprise add-on. LW-DETR and D-FINE are Apache 2.0.
+
 ### Detection
 
 <img alt="rf_detr_1-4_latency_accuracy_object_detection" src="https://storage.googleapis.com/com-roboflow-marketing/rf-detr/rf_detr_1-4_latency_accuracy_object_detection.png" />
@@ -60,6 +66,9 @@ RF-DETR achieves state-of-the-art results in both object detection and instance 
 
 | Architecture  | COCO AP<sub>50</sub> | COCO AP<sub>50:95</sub> | RF100VL AP<sub>50</sub> | RF100VL AP<sub>50:95</sub> | Latency (ms) | Params (M) | Resolution |  License   |
 | :-----------: | :------------------: | :---------------------: | :---------------------: | :------------------------: | :----------: | :--------: | :--------: | :--------: |
+|  RF-DETR-A △  |         49.4         |          30.5           |          78.2           |            48.3            |     1.0      |    7.4     |  380x380   |  PML 1.0   |
+|  RF-DETR-F △  |         55.9         |          37.8           |          82.5           |            53.8            |     1.4      |    7.9     |  384x384   |  PML 1.0   |
+|  RF-DETR-P △  |         60.2         |          41.6           |          84.1           |            56.0            |     1.7      |    8.4     |  560x560   |  PML 1.0   |
 |   RF-DETR-N   |         67.6         |          48.4           |          85.0           |            57.7            |     2.3      |    30.5    |  384x384   | Apache 2.0 |
 |   RF-DETR-S   |         72.1         |          53.0           |          86.7           |            60.2            |     3.5      |    32.1    |  512x512   | Apache 2.0 |
 |   RF-DETR-M   |         73.6         |          54.7           |          87.4           |            61.2            |     4.4      |    33.7    |  576x576   | Apache 2.0 |
@@ -210,6 +219,9 @@ annotated_image = sv.LabelAnnotator().annotate(annotated_image, detections)
 
 | Size | RF-DETR package class | Inference package alias | COCO AP<sub>50</sub> | COCO AP<sub>50:95</sub> | Latency (ms) | Params (M) | Resolution |  License   |
 | :--: | :-------------------: | :---------------------- | :------------------: | :---------------------: | :----------: | :--------: | :--------: | :--------: |
+|  A   |    `RFDETRAtto` △     | `rfdetr-atto`           |         49.4         |          30.5           |     1.0      |    7.4     |  380x380   |  PML 1.0   |
+|  F   |    `RFDETRFemto` △    | `rfdetr-femto`          |         55.9         |          37.8           |     1.4      |    7.9     |  384x384   |  PML 1.0   |
+|  P   |    `RFDETRPico` △     | `rfdetr-pico`           |         60.2         |          41.6           |     1.7      |    8.4     |  560x560   |  PML 1.0   |
 |  N   |     `RFDETRNano`      | `rfdetr-nano`           |         67.6         |          48.4           |     2.3      |    30.5    |  384x384   | Apache 2.0 |
 |  S   |     `RFDETRSmall`     | `rfdetr-small`          |         72.1         |          53.0           |     3.5      |    32.1    |  512x512   | Apache 2.0 |
 |  M   |    `RFDETRMedium`     | `rfdetr-medium`         |         73.6         |          54.7           |     4.4      |    33.7    |  576x576   | Apache 2.0 |
@@ -299,10 +311,15 @@ Visit our [documentation website](https://rfdetr.roboflow.com) to learn more abo
 
 ## License
 
-Licensing is split by component:
+RF-DETR is commercially usable. Licensing is split by component:
 
-- The open-source `rfdetr` package and Apache-designated model weights are licensed under Apache License 2.0. See [`LICENSE`](LICENSE).
-- Plus components, including the `rfdetr_plus` extension and RF-DETR-XL / RF-DETR-2XL detection models, are licensed under PML 1.0.
+| Component                                                                                | License                                                                                                 | What it means in practice                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rfdetr` package (training, inference and export code)                                   | [Apache 2.0](LICENSE)                                                                                   | Commercially usable out of the box: you can ship it in closed-source, commercial products, including self-hosted deployments, without paying a license fee or open-sourcing your code. |
+| RF-DETR Nano, Small, Medium and Large detection                                          | Apache 2.0                                                                                              | Same as above.                                                                                                                                                                         |
+| RF-DETR-Seg, every size (Nano through 2XLarge)                                           | Apache 2.0                                                                                              | Same as above.                                                                                                                                                                         |
+| RF-DETR Keypoint (Preview)                                                               | Apache 2.0                                                                                              | Same as above.                                                                                                                                                                         |
+| RF-DETR Atto, Femto, Pico, XL and 2XL detection (`rfdetr[plus]`), and RF-DETR NAS models | [Roboflow Platform Model License (PML 1.0)](https://github.com/roboflow/rf-detr_plus/blob/main/LICENSE) | Commercial use is included when you deploy on Roboflow; commercial self-hosting requires the Enterprise add-on ([details](https://roboflow.com/licensing)).                            |
 
 ## Acknowledgements
 

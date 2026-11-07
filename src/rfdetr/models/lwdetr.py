@@ -183,6 +183,8 @@ class LWDETR(nn.Module):
             )
         # Flag to ensure the zero-pad warning in ``_aggregate_keypoint_class_logits`` is emitted at most once.
         self._kp_zero_pad_warned = False
+        # Flag to ensure the missing-encoder-layers warning in ``update_drop_path`` is emitted at most once.
+        self._drop_path_layers_warned = False
         self.keypoint_embed: MLP | None
         if self.use_grouppose_keypoints:
             self.keypoint_embed = MLP(
@@ -456,7 +458,13 @@ class LWDETR(nn.Module):
             class_boost = class_boost[..., :detection_num_classes]
         return class_boost
 
-    def forward(self, samples: NestedTensor, targets: list[dict[str, Tensor]] | None = None) -> dict[str, Any]:
+    def forward(
+        self,
+        samples: NestedTensor,
+        targets: list[dict[str, Tensor]] | None = None,
+        *,
+        all_layer_masks: bool = False,
+    ) -> dict[str, Any]:
         """The forward expects a NestedTensor, which consists of:
 
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -471,6 +479,20 @@ class LWDETR(nn.Module):
                            information on how to retrieve the unnormalized bounding box.
            - "aux_outputs": Optional, only returned when auxiliary losses are activated. It is a list of
                             dictionaries containing the two above keys for each decoder layer.
+
+        Segmentation models also return "pred_masks". In training mode the auxiliary layers and "enc_outputs" carry
+        "pred_masks" too, for the loss; in eval mode they do so only when ``all_layer_masks`` is set, because
+        nothing but the criterion reads them and each is a dense ``(B, Q)`` mask map at the segmentation head's
+        resolution, a quarter of the input size by default.
+
+        Args:
+            samples: Batched images, a ``NestedTensor`` or a list or tensor of images.
+            targets: Unused; kept for call compatibility.
+            all_layer_masks: In eval mode, also compute the segmentation masks of the auxiliary decoder layers and
+                of the encoder proposals, as a loss on eval-mode outputs needs. Training mode always computes them.
+
+        Returns:
+            The prediction dict described above.
         """
         if isinstance(samples, (list, Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -494,6 +516,8 @@ class LWDETR(nn.Module):
 
         if self.segmentation_head is not None:
             seg_head_fwd = self.segmentation_head.sparse_forward if self.training else self.segmentation_head.forward
+        # Only SetCriterion reads the auxiliary-layer and encoder-proposal masks.
+        aux_masks = self.training or all_layer_masks
 
         cross_attn_srcs = None
         if cross_attn_features is not None:
@@ -565,7 +589,13 @@ class LWDETR(nn.Module):
                 outputs_class = outputs_class + self._aggregate_keypoint_class_logits(outputs_keypoints)
 
             if self.segmentation_head is not None:
-                outputs_masks = seg_head_fwd(features[0].tensors, hs, cast(tuple[int, int], samples.tensors.shape[-2:]))
+                image_size = cast(tuple[int, int], samples.tensors.shape[-2:])
+                if aux_masks:
+                    outputs_masks = seg_head_fwd(features[0].tensors, hs, image_size)
+                else:
+                    outputs_masks = self.segmentation_head.forward(
+                        features[0].tensors, hs, image_size, final_layer_only=True
+                    )
 
             out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
             if self.segmentation_head is not None:
@@ -576,7 +606,7 @@ class LWDETR(nn.Module):
                 out["aux_outputs"] = self._set_aux_loss(
                     outputs_class,
                     outputs_coord,
-                    outputs_masks if self.segmentation_head is not None else None,
+                    outputs_masks if self.segmentation_head is not None and aux_masks else None,
                     outputs_keypoints,
                 )
 
@@ -605,7 +635,8 @@ class LWDETR(nn.Module):
                 )
                 cls_enc = cls_enc + self._aggregate_keypoint_class_logits(keypoints_enc)
 
-            if self.segmentation_head is not None:
+            # Without decoder layers the encoder proposals are the predictions, so their masks are always needed.
+            if self.segmentation_head is not None and (aux_masks or hs is None):
                 masks_enc = seg_head_fwd(
                     features[0].tensors,
                     [
@@ -617,7 +648,7 @@ class LWDETR(nn.Module):
 
             if hs is not None:
                 out["enc_outputs"] = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
-                if self.segmentation_head is not None:
+                if self.segmentation_head is not None and aux_masks:
                     out["enc_outputs"]["pred_masks"] = masks_enc
                 if keypoints_enc is not None:
                     out["enc_outputs"]["pred_keypoints"] = keypoints_enc
@@ -782,9 +813,21 @@ class LWDETR(nn.Module):
         Args:
             drop_path_rate: Maximum drop path rate (applied to last layer).
             vit_encoder_num_layers: Number of encoder layers to update.
+
+        Note:
+            When the encoder exposes no recognised layer layout (see ``_get_backbone_encoder_layers``) the schedule
+            cannot be applied; a positive ``drop_path_rate`` then logs a warning, once per model instance.
         """
         layers = self._get_backbone_encoder_layers()
         if layers is None:
+            if drop_path_rate > 0 and not self._drop_path_layers_warned:
+                logger.warning(
+                    "drop_path_rate=%s was requested but the backbone encoder exposes no recognised layer layout "
+                    "(expected `blocks`, `trunk.blocks` or the HuggingFace DINOv2 `encoder.encoder.layer`); the "
+                    "drop-path schedule is skipped. This warning is emitted once per model instance.",
+                    drop_path_rate,
+                )
+                self._drop_path_layers_warned = True
             return
         n = min(vit_encoder_num_layers, len(layers))
         dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, n)]

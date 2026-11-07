@@ -12,10 +12,10 @@ description: Export RF-DETR models to LiteRT (`.tflite`) straight from PyTorch u
 
     - Float32 only: `quantization` other than `None` / `"fp32"` raises `NotImplementedError` on this route (use `format="tflite"` for its FP16/INT8 modes, or quantize the exported file with [ai-edge-quantizer](https://github.com/google-ai-edge/ai-edge-quantizer)).
     - `dynamic_batch=True` is not supported: the `.tflite` bakes a fixed input shape, so export one file per batch size.
-    - Keypoint models are not supported on litert-torch 0.9.4: its converter rejects the rank-4 `batch_matmul` that the keypoint head's `nn.Linear` lowers to.
+    - Keypoint models are not supported: litert-torch rejects the rank-4 `batch_matmul` that the keypoint head's `nn.Linear` lowers to, so `format="litert"` refuses them with `NotImplementedError` before converting. A `backbone_only=True` export of a keypoint model still converts. Use `format="tflite"` or `format="onnx"` for keypoint models.
     - The single exported graph includes the two-stage query selection (`TOPK_V2` / `GATHER_ND`), which the LiteRT GPU delegate has no kernels for, so the file runs on the CPU (XNNPACK) delegate. Running the detector on a phone GPU needs further graph rewrites and a two-graph split that this route does not do yet.
 
-LiteRT (formerly TensorFlow Lite) is Google's on-device runtime. `format="litert"` hands the PyTorch model to [litert-torch](https://github.com/google-ai-edge/litert-torch), which captures it with `torch.export` and lowers it to a `.tflite` file directly — no ONNX and no TensorFlow step, unlike the [TFLite export](tflite.md) which converts ONNX → TensorFlow → TFLite with `onnx2tf`. Both routes produce a `.tflite` that the same `ai_edge_litert` interpreter runs; this one keeps PyTorch's NCHW layout and the deformable-attention sampling as litert-torch lowers it. On CPU the exported graphs track eager PyTorch closely. Measured with the pretrained Nano and Seg-Nano checkpoints on a real photo, the ten highest-confidence queries differ by at most about `1e-7` for boxes and `3e-5` for class logits and mask probabilities; across all 300 queries the maxima rise to about `6e-6` (boxes), `4e-4` (class logits) and `2e-3` (raw mask logits, about `3e-5` after sigmoid), because low-confidence proposals reorder slightly between backends. The `e2e_litert` test suite asserts looser bounds on the confident queries (boxes `1e-3`, logits `0.1`, mask probabilities `0.05`) as a regression gate; those bounds are not the measured precision.
+LiteRT (formerly TensorFlow Lite) is Google's on-device runtime. `format="litert"` hands the PyTorch model to [litert-torch](https://github.com/google-ai-edge/litert-torch), which captures it with `torch.export` and lowers it to a `.tflite` file directly — no ONNX and no TensorFlow step, unlike the [TFLite export](tflite.md) which converts ONNX → TensorFlow → TFLite with `onnx2tf`. Both routes produce a `.tflite` that the same `ai_edge_litert` interpreter runs; this one keeps PyTorch's NCHW layout. The deformable attention samples its value maps from zero-padded pixel rows, with one `EMBEDDING_LOOKUP` per bilinear corner, instead of litert-torch's own `grid_sample` lowering, whose channel-expanded `GATHER_ND` indices run outside the XNNPACK delegate. The values are the same, and the detector runs about twice as fast on CPU. On CPU the exported graphs track eager PyTorch closely. Measured with the pretrained Nano and Seg-Nano checkpoints on a real photo, the ten highest-confidence queries differ by at most about `1e-7` for boxes and `3e-5` for class logits and mask probabilities; across all 300 queries the maxima rise to about `6e-6` (boxes), `4e-4` (class logits) and `2e-3` (raw mask logits, about `3e-5` after sigmoid), because low-confidence proposals reorder slightly between backends. The `e2e_litert` test suite asserts looser bounds on the confident queries (boxes `1e-3`, logits `0.1`, mask probabilities `0.05`) as a regression gate; those bounds are not the measured precision.
 
 ## Prerequisites
 
@@ -47,7 +47,22 @@ pip install "rfdetr[litert]"
 
 This writes one float32 file named after the model's variant, `output/<model-variant>.tflite` (for example `output/rfdetr-small.tflite`; `-backbone` is appended with `backbone_only=True`, and `output_name` overrides the stem). `shape=(H, W)` picks a custom resolution exactly as for the other formats.
 
-## LiteRT Inference Example
+## Measured Latency on a Laptop CPU
+
+No latency table is published for this format yet. The earlier rows were measured before the cookbook pinned one thread count for every runtime, so they were not comparable across runtimes and have been removed pending a rerun of the [mobile cookbook](../../cookbooks/export-mobile/).
+
+## Predict with RFDETRInference
+
+```python
+from rfdetr import RFDETRInference
+
+model = RFDETRInference("output/rfdetr-small.tflite")
+detections = model.predict("image.jpg", threshold=0.5)
+```
+
+LiteRT artifacts use their metadata to identify the NCHW input layout. The shared API returns the same Supervision result types as the native model. See [Predict with RFDETRInference](basics.md#predict-with-rfdetrinference) for checkpoint inputs, metadata, and batch behavior.
+
+## Advanced: Use the LiteRT interpreter directly
 
 The file has one input (NCHW float32, ImageNet-normalized like `predict()`) and positional outputs: boxes `[batch, 300, 4]` in normalized `cxcywh`, class logits `[batch, 300, num_classes]`, and — for segmentation models — mask logits as a third output. Output tensor names are litert-torch's own (`serving_default_output_<i>_output`), so match outputs by position, as for the CoreML and OpenVINO exports.
 

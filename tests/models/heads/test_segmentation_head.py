@@ -8,17 +8,27 @@
 import inspect
 import threading
 import time
+import types
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
-from rfdetr.models.heads.segmentation import DepthwiseConvBlock, SegmentationHead, point_sample
+from rfdetr.models.heads import segmentation as segmentation_module
+from rfdetr.models.heads.segmentation import (
+    DepthwiseConvBlock,
+    SegmentationHead,
+    _cudnn_disabled,
+    _DepthwiseConvWithoutCuDNN,
+    conv2d_input,
+    point_sample,
+)
 from rfdetr.utilities.tensors import _nearest_grid_sample
+from tests._markers import _cuda_marks, _requires_cuda, _requires_onnx
 
 
 @pytest.fixture(autouse=True)
@@ -27,23 +37,46 @@ def _reset_random_seeds() -> None:
     torch.manual_seed(42)
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        pytest.param("cpu", id="cpu"),
-        pytest.param(
-            "cuda",
-            id="gpu",
-            marks=[
-                pytest.mark.gpu,
-                pytest.mark.skipif(
-                    not torch.cuda.is_available(),
-                    reason="CUDA is not available",
-                ),
-            ],
-        ),
-    ],
-)
+@pytest.fixture
+def force_depthwise_workaround(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Route the depthwise conv through the issue #731 workaround on every CUDA device.
+
+    Ampere and newer GPUs take the plain cuDNN convolution by default, so tests of the workaround itself pin the route
+    with ``RFDETR_DEPTHWISE_CUDNN=0`` and clear the per-device cache on both sides.
+    """
+    monkeypatch.setenv("RFDETR_DEPTHWISE_CUDNN", "0")
+    segmentation_module._cudnn_depthwise_is_safe.cache_clear()
+    yield
+    segmentation_module._cudnn_depthwise_is_safe.cache_clear()
+
+
+@pytest.fixture
+def cudnn_flag_calls(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record the ``enabled`` argument of every ``torch.backends.cudnn.flags`` call made during the test."""
+    enabled_calls: list[bool] = []
+    original_flags = torch.backends.cudnn.flags
+
+    @contextmanager
+    def _tracking_flags(*, enabled: bool):
+        enabled_calls.append(enabled)
+        with original_flags(enabled=enabled):
+            yield
+
+    monkeypatch.setattr(torch.backends.cudnn, "flags", _tracking_flags)
+    return enabled_calls
+
+
+_DEVICES = [
+    pytest.param("cpu", id="cpu"),
+    pytest.param(
+        "cuda",
+        id="gpu",
+        marks=_cuda_marks,
+    ),
+]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
 def test_depthwise_conv_block_forward(device: str) -> None:
     """DepthwiseConvBlock forward pass produces correct output shape without error."""
     block = DepthwiseConvBlock(dim=8).to(device)
@@ -53,8 +86,9 @@ def test_depthwise_conv_block_forward(device: str) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_depthwise_conv_forward_disables_cudnn_on_cuda(monkeypatch) -> None:
+@_requires_cuda
+@pytest.mark.usefixtures("force_depthwise_workaround")
+def test_depthwise_conv_forward_disables_cudnn_on_cuda(cudnn_flag_calls: list[bool]) -> None:
     """On CUDA, forward must run with cuDNN disabled.
 
     ``_cudnn_disabled()`` gates entry on ``x.is_cuda`` (see the module comment): only a CUDA tensor
@@ -62,25 +96,15 @@ def test_depthwise_conv_forward_disables_cudnn_on_cuda(monkeypatch) -> None:
     never reads the flag for a CPU tensor in the first place.
     """
     block = DepthwiseConvBlock(dim=8).to("cuda")
-    enabled_calls: list[bool] = []
-    original_flags = torch.backends.cudnn.flags
-
-    @contextmanager
-    def _tracking_flags(*, enabled: bool):
-        enabled_calls.append(enabled)
-        with original_flags(enabled=enabled):
-            yield
-
-    monkeypatch.setattr(torch.backends.cudnn, "flags", _tracking_flags)
 
     x = torch.randn(1, 8, 4, 4, device="cuda")
     y = block(x)
     assert y.shape == x.shape
-    assert enabled_calls, "torch.backends.cudnn.flags was never called"
-    assert all(not e for e in enabled_calls)
+    assert cudnn_flag_calls, "torch.backends.cudnn.flags was never called"
+    assert all(not e for e in cudnn_flag_calls)
 
 
-def test_depthwise_conv_forward_skips_cudnn_flags_on_cpu(monkeypatch) -> None:
+def test_depthwise_conv_forward_skips_cudnn_flags_on_cpu(cudnn_flag_calls: list[bool]) -> None:
     """On CPU, forward must NOT touch ``torch.backends.cudnn.flags`` at all.
 
     ATen's ``ConvParams::use_cudnn`` short-circuits on ``!input.is_cuda()`` before ever reading the
@@ -88,26 +112,17 @@ def test_depthwise_conv_forward_skips_cudnn_flags_on_cpu(monkeypatch) -> None:
     callers (see F1). ``_cudnn_disabled()`` gates on ``x.is_cuda`` precisely to keep this path untouched.
     """
     block = DepthwiseConvBlock(dim=8)
-    enabled_calls: list[bool] = []
-    original_flags = torch.backends.cudnn.flags
-
-    @contextmanager
-    def _tracking_flags(*, enabled: bool):
-        enabled_calls.append(enabled)
-        with original_flags(enabled=enabled):
-            yield
-
-    monkeypatch.setattr(torch.backends.cudnn, "flags", _tracking_flags)
 
     x = torch.randn(1, 8, 4, 4)
     y = block(x)
     assert y.shape == x.shape
-    assert not enabled_calls, "torch.backends.cudnn.flags must not be called for a CPU tensor"
+    assert not cudnn_flag_calls, "torch.backends.cudnn.flags must not be called for a CPU tensor"
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_depthwise_conv_backward_disables_cudnn_on_cuda(monkeypatch) -> None:
+@_requires_cuda
+@pytest.mark.usefixtures("force_depthwise_workaround")
+def test_depthwise_conv_backward_disables_cudnn_on_cuda(cudnn_flag_calls: list[bool]) -> None:
     """Backward pass must also run with cuDNN disabled on CUDA (issue #731).
 
     The previous fix (PR #728) only wrapped the forward pass in a context manager.  The backward kernels ran with cuDNN
@@ -115,16 +130,6 @@ def test_depthwise_conv_backward_disables_cudnn_on_cuda(monkeypatch) -> None:
     still hold on CUDA even though the CPU path (below) now skips the scope entirely.
     """
     block = DepthwiseConvBlock(dim=8).to("cuda")
-    enabled_calls: list[bool] = []
-    original_flags = torch.backends.cudnn.flags
-
-    @contextmanager
-    def _tracking_flags(*, enabled: bool):
-        enabled_calls.append(enabled)
-        with original_flags(enabled=enabled):
-            yield
-
-    monkeypatch.setattr(torch.backends.cudnn, "flags", _tracking_flags)
 
     x = torch.randn(1, 8, 4, 4, device="cuda", requires_grad=True)
     y = block(x)
@@ -133,27 +138,17 @@ def test_depthwise_conv_backward_disables_cudnn_on_cuda(monkeypatch) -> None:
     assert x.grad is not None
     assert x.grad.shape == x.shape
     # cuDNN must be disabled for both forward and backward
-    assert len(enabled_calls) >= 2
-    assert all(not e for e in enabled_calls)
+    assert len(cudnn_flag_calls) >= 2
+    assert all(not e for e in cudnn_flag_calls)
 
 
-def test_depthwise_conv_backward_skips_cudnn_flags_on_cpu(monkeypatch) -> None:
+def test_depthwise_conv_backward_skips_cudnn_flags_on_cpu(cudnn_flag_calls: list[bool]) -> None:
     """On CPU, backward must NOT touch ``torch.backends.cudnn.flags`` either.
 
     Backward gates on the saved (forward-input) tensor's device, mirroring the forward gate, so a CPU-only training step
     never mutates the process-global cuDNN flags.
     """
     block = DepthwiseConvBlock(dim=8)
-    enabled_calls: list[bool] = []
-    original_flags = torch.backends.cudnn.flags
-
-    @contextmanager
-    def _tracking_flags(*, enabled: bool):
-        enabled_calls.append(enabled)
-        with original_flags(enabled=enabled):
-            yield
-
-    monkeypatch.setattr(torch.backends.cudnn, "flags", _tracking_flags)
 
     x = torch.randn(1, 8, 4, 4, requires_grad=True)
     y = block(x)
@@ -161,26 +156,10 @@ def test_depthwise_conv_backward_skips_cudnn_flags_on_cpu(monkeypatch) -> None:
 
     assert x.grad is not None
     assert x.grad.shape == x.shape
-    assert not enabled_calls, "torch.backends.cudnn.flags must not be called for a CPU tensor"
+    assert not cudnn_flag_calls, "torch.backends.cudnn.flags must not be called for a CPU tensor"
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        pytest.param("cpu", id="cpu"),
-        pytest.param(
-            "cuda",
-            id="gpu",
-            marks=[
-                pytest.mark.gpu,
-                pytest.mark.skipif(
-                    not torch.cuda.is_available(),
-                    reason="CUDA is not available",
-                ),
-            ],
-        ),
-    ],
-)
+@pytest.mark.parametrize("device", _DEVICES)
 def test_depthwise_conv_backward_produces_correct_gradients(device: str) -> None:
     """Backward pass through DepthwiseConvBlock produces valid gradients."""
     block = DepthwiseConvBlock(dim=8).to(device)
@@ -257,10 +236,6 @@ def test_depthwise_conv_backward_bf16_activation_keeps_grads_fp32() -> None:
     This test drives the backward directly with a bf16 saved activation to reproduce the dtype that is present at
     training time without requiring a GPU.
     """
-    import types
-
-    from rfdetr.models.heads.segmentation import _DepthwiseConvWithoutCuDNN
-
     dim = 8
     weight = torch.randn(dim, 1, 3, 3, requires_grad=True)  # fp32 parameter (never cast by AMP)
     x_bf16 = torch.randn(1, dim, 4, 4, dtype=torch.bfloat16)  # bf16 activation (cast by AMP forward)
@@ -295,8 +270,6 @@ def test_depthwise_conv_no_cudnn_bias_none() -> None:
     Exercises the ctx.has_bias=False branch in forward and the grad_bias=None return in backward — never reached via
     DepthwiseConvBlock (always has bias).
     """
-    from rfdetr.models.heads.segmentation import _DepthwiseConvWithoutCuDNN
-
     dim = 8
     weight = torch.randn(dim, 1, 3, 3, requires_grad=True)
     x = torch.randn(1, dim, 4, 4, requires_grad=True)
@@ -345,8 +318,6 @@ class TestCudnnDisabledConcurrency:
         (``inspect.getsource(torch.backends.cudnn.flags)`` shows concrete defaults, never a preserving sentinel), so the
         pre-fix race that dropped ``enabled`` drops ``benchmark`` the same way.
         """
-        from rfdetr.models.heads.segmentation import _cudnn_disabled
-
         monkeypatch.setattr(torch.backends.cudnn, "benchmark", True)
         num_workers = 3
         barrier = threading.Barrier(num_workers)
@@ -376,7 +347,7 @@ class TestCudnnDisabledConcurrency:
         assert torch.backends.cudnn.enabled is True
         assert torch.backends.cudnn.benchmark is True
 
-    def test_restores_flag_and_releases_lock_when_conv_raises(self) -> None:
+    def test_restores_flag_and_releases_lock_when_conv_raises(self, mocker) -> None:
         """An exception inside ``_cudnn_disabled()`` must still restore the flag and release the lock.
 
         ``mock.patch.object(F, "conv2d", side_effect=RuntimeError)`` drives the raise through a direct
@@ -384,11 +355,10 @@ class TestCudnnDisabledConcurrency:
         ``_cudnn_disabled()`` call on a separate thread, joined with a bounded timeout, confirms the lock
         was released: a leaked lock would otherwise only surface as a 240s pytest-timeout.
         """
-        from rfdetr.models.heads.segmentation import _cudnn_disabled
+        mocker.patch.object(F, "conv2d", side_effect=RuntimeError("boom"))
 
-        with mock.patch.object(F, "conv2d", side_effect=RuntimeError("boom")):
-            with pytest.raises(RuntimeError, match="boom"), _cudnn_disabled():
-                F.conv2d(torch.randn(1, 1, 4, 4), torch.randn(1, 1, 3, 3), padding=1)
+        with pytest.raises(RuntimeError, match="boom"), _cudnn_disabled():
+            F.conv2d(torch.randn(1, 1, 4, 4), torch.randn(1, 1, 3, 3), padding=1)
 
         assert torch.backends.cudnn.enabled is True
 
@@ -415,8 +385,6 @@ class TestCudnnDisabledConcurrency:
         CPU-triggering autograd cross-scope path is exercised on GPU by
         ``test_restores_flag_under_concurrent_overlapping_calls_gpu``.
         """
-        from rfdetr.models.heads.segmentation import _cudnn_disabled, conv2d_input
-
         dim = 4
         weight = torch.randn(dim, 1, 3, 3)
         grad_output = torch.randn(1, dim, 4, 4)
@@ -455,8 +423,8 @@ class TestCudnnDisabledConcurrency:
         assert torch.backends.cudnn.enabled is True
 
     @pytest.mark.gpu
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-    def test_restores_flag_under_concurrent_overlapping_calls_gpu(self) -> None:
+    @_requires_cuda
+    def test_restores_flag_under_concurrent_overlapping_calls_gpu(self, mocker) -> None:
         """GPU mirror: overlapping ``_DepthwiseConvWithoutCuDNN.apply()`` calls on real CUDA tensors.
 
         Real CUDA tensors satisfy ``x.is_cuda``, so once ``_cudnn_disabled()`` gates entry on it, ``.apply()`` still
@@ -464,8 +432,6 @@ class TestCudnnDisabledConcurrency:
         must call ``_cudnn_disabled()`` directly to keep exercising the lock after that gate lands. A slow stand-in for
         ``F.conv2d`` widens the overlap window.
         """
-        from rfdetr.models.heads.segmentation import _DepthwiseConvWithoutCuDNN
-
         dim = 4
         weight = torch.randn(dim, 1, 3, 3, device="cuda")
         x = torch.randn(1, dim, 4, 4, device="cuda")
@@ -486,12 +452,12 @@ class TestCudnnDisabledConcurrency:
             except BaseException as exc:
                 errors.append(exc)
 
-        with mock.patch.object(F, "conv2d", slow_conv2d):
-            threads = [threading.Thread(target=worker) for _ in range(num_workers)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=5)
+        mocker.patch.object(F, "conv2d", slow_conv2d)
+        threads = [threading.Thread(target=worker) for _ in range(num_workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
 
         for thread in threads:
             assert not thread.is_alive(), "worker thread did not finish within 5s — possible deadlock"
@@ -499,9 +465,8 @@ class TestCudnnDisabledConcurrency:
         assert torch.backends.cudnn.enabled is True
 
 
-@pytest.mark.parametrize(
-    "layer_scale_init_value", [pytest.param(0, id="no_gamma"), pytest.param(1e-6, id="with_gamma")]
-)
+# 0 -> no gamma parameter; 1e-6 -> learnable gamma.
+@pytest.mark.parametrize("layer_scale_init_value", [0, 1e-6])
 def test_depthwise_conv_block_layer_scale(layer_scale_init_value: float) -> None:
     """DepthwiseConvBlock with and without layer scaling produces valid output and gradients.
 
@@ -518,6 +483,75 @@ def test_depthwise_conv_block_layer_scale(layer_scale_init_value: float) -> None
     if layer_scale_init_value > 0:
         assert block.gamma is not None
         assert block.gamma.grad is not None
+
+
+class TestCudnnDepthwiseGate:
+    """The issue #731 workaround is limited to the GPUs where cuDNN depthwise selection fails."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_gate_cache(self) -> Iterator[None]:
+        segmentation_module._cudnn_depthwise_is_safe.cache_clear()
+        yield
+        segmentation_module._cudnn_depthwise_is_safe.cache_clear()
+
+    @pytest.mark.parametrize(
+        ("capability", "expected"), [((6, 0), False), ((7, 5), False), ((8, 0), True), ((12, 0), True)]
+    )
+    def test_auto_decides_by_compute_capability(
+        self, monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], expected: bool
+    ) -> None:
+        """Pre-Ampere devices (P100, T4) keep the workaround; Ampere and newer use cuDNN."""
+        monkeypatch.delenv("RFDETR_DEPTHWISE_CUDNN", raising=False)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _index: capability)
+
+        assert segmentation_module._cudnn_depthwise_is_safe(0) is expected
+
+    @pytest.mark.parametrize(("value", "expected"), [("1", True), ("0", False), (" AUTO ", True)])
+    def test_environment_overrides_detection(self, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool) -> None:
+        """``RFDETR_DEPTHWISE_CUDNN`` forces either route regardless of the device."""
+        monkeypatch.setenv("RFDETR_DEPTHWISE_CUDNN", value)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _index: (8, 6))
+
+        assert segmentation_module._cudnn_depthwise_is_safe(0) is expected
+
+    def test_invalid_environment_value_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A typo in the override fails loudly instead of silently picking a route."""
+        monkeypatch.setenv("RFDETR_DEPTHWISE_CUDNN", "yes")
+
+        with pytest.raises(ValueError, match="RFDETR_DEPTHWISE_CUDNN"):
+            segmentation_module._cudnn_depthwise_is_safe(0)
+
+    @pytest.mark.gpu
+    @_requires_cuda
+    def test_cudnn_route_matches_workaround(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both routes compute the same forward output and gradients."""
+        block = DepthwiseConvBlock(dim=16).cuda()
+        x = torch.randn(1, 16, 24, 24, device="cuda")
+        results = {}
+        for mode in ("0", "1"):
+            segmentation_module._cudnn_depthwise_is_safe.cache_clear()
+            monkeypatch.setenv("RFDETR_DEPTHWISE_CUDNN", mode)
+            block.zero_grad()
+            inputs = x.clone().requires_grad_()
+            out = block(inputs)
+            out.square().sum().backward()
+            results[mode] = (out.detach(), inputs.grad, block.dwconv.weight.grad.clone())
+
+        for workaround, cudnn in zip(results["0"], results["1"]):
+            torch.testing.assert_close(cudnn, workaround, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.gpu
+    @_requires_cuda
+    def test_cudnn_route_skips_the_workaround(self, mocker, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With cuDNN allowed, the depthwise conv runs as the plain module, without toggling cuDNN."""
+        monkeypatch.setenv("RFDETR_DEPTHWISE_CUDNN", "1")
+        workaround = mocker.MagicMock(wraps=segmentation_module._DepthwiseConvWithoutCuDNN.apply)
+        monkeypatch.setattr(segmentation_module._DepthwiseConvWithoutCuDNN, "apply", workaround)
+        block = DepthwiseConvBlock(dim=8).cuda()
+
+        block(torch.randn(1, 8, 4, 4, device="cuda"))
+
+        workaround.assert_not_called()
 
 
 class TestSegmentationHeadSkipBlocksAppliesProjection:
@@ -573,10 +607,8 @@ class TestSegmentationHeadSkipBlocksAppliesProjection:
 
         torch.testing.assert_close(actual["spatial_features"], expected_proj)
 
-    @pytest.mark.parametrize(
-        "bottleneck_ratio",
-        [pytest.param(1, id="same_channels"), pytest.param(2, id="projected_channels")],
-    )
+    # 1 -> same channels; 2 -> projected (reduced) channels.
+    @pytest.mark.parametrize("bottleneck_ratio", [1, 2])
     def test_forward_export_skip_blocks_matches_training_path(self, bottleneck_ratio: int) -> None:
         """Exported encoder-only masks must apply the same spatial projection as the training path."""
         head = self._build_head(bottleneck_ratio)
@@ -665,6 +697,7 @@ class TestSegmentationHeadForwardExport:
 
     @pytest.mark.parametrize("num_blocks", [1, 3])
     def test_matches_eager_eval_path_last_layer(self, num_blocks: int) -> None:
+        """Export-mode output equals the last mask of the eager all-layer ``forward`` for 1 and several blocks."""
         head = SegmentationHead(in_dim=4, num_blocks=num_blocks, bottleneck_ratio=2, downsample_ratio=1)
         spatial_features = torch.randn(2, 4, 4, 4)
         query_features = torch.randn(2, 3, 4)
@@ -713,10 +746,13 @@ class TestSegmentationHeadForwardExport:
         assert actual.shape == (2, 3, 5, 7)
         torch.testing.assert_close(actual, expected)
 
+    @_requires_onnx
     @pytest.mark.integration
     @pytest.mark.e2e_onnx
     def test_onnx_graph_has_no_einsum(self, tmp_path: Path) -> None:
-        onnx = pytest.importorskip("onnx", reason="onnx not installed; skip ONNX export tests")
+        """The exported ONNX graph contains no Einsum op, which ONNX Runtime's CoreML provider cannot run."""
+        import onnx
+
         head = SegmentationHead(in_dim=4, num_blocks=1, bottleneck_ratio=2, downsample_ratio=1).eval()
         head.export()
         out = tmp_path / "segmentation_head.onnx"
@@ -733,6 +769,41 @@ class TestSegmentationHeadForwardExport:
         assert "Einsum" not in {node.op_type for node in onnx.load(str(out)).graph.node}
 
 
+class TestSegmentationHeadFinalLayerOnly:
+    """``forward(final_layer_only=True)`` must return exactly the last layer ``forward()`` returns, and nothing else.
+
+    Eval-mode ``LWDETR`` uses it so ``predict()`` and validation skip the dense einsum for every auxiliary decoder
+    layer; the kept mask must not change by a single bit.
+    """
+
+    @pytest.mark.parametrize(
+        ("num_blocks", "num_layers", "bottleneck_ratio"),
+        [
+            (3, 3, 1),  # one block per layer
+            (3, 3, 2),  # projected channels
+            (3, 2, 1),  # fewer layers than blocks
+            (2, 3, 1),  # fewer blocks than layers
+            (1, 1, 1),  # single layer
+        ],
+    )
+    def test_final_layer_only_matches_last_layer_bit_exactly(
+        self, num_blocks: int, num_layers: int, bottleneck_ratio: int
+    ) -> None:
+        """The single returned mask equals the last element of the all-layer output, bit for bit."""
+        torch.manual_seed(0)
+        head = SegmentationHead(in_dim=8, num_blocks=num_blocks, bottleneck_ratio=bottleneck_ratio, downsample_ratio=2)
+        spatial_features = torch.randn(2, 8, 5, 5)
+        query_features = list(torch.randn(num_layers, 2, 3, 8))
+        image_size = (20, 20)
+
+        with torch.no_grad():
+            all_layers = head.forward(spatial_features, query_features, image_size)
+            final_only = head.forward(spatial_features, query_features, image_size, final_layer_only=True)
+
+        assert (len(all_layers), len(final_only)) == (min(num_blocks, num_layers), 1)
+        assert torch.equal(final_only[0], all_layers[-1]), "final_layer_only changed the last layer's mask logits"
+
+
 class TestPointSampleNearestRouting:
     """``mode="nearest"`` must use the backend-agnostic gather path, not ``F.grid_sample``.
 
@@ -741,16 +812,13 @@ class TestPointSampleNearestRouting:
     """
 
     @pytest.mark.parametrize("padding_mode", ["zeros", "border"])
-    def test_nearest_routes_through_the_gather_helper(self, padding_mode: str) -> None:
+    def test_nearest_routes_through_the_gather_helper(self, mocker, padding_mode: str) -> None:
         """Without the routing change this call reaches ``F.grid_sample`` instead."""
         input = torch.randn(1, 2, 6, 6)
         point_coords = torch.rand(1, 5, 2)
+        spy = mocker.patch("rfdetr.models.heads.segmentation._nearest_grid_sample", wraps=_nearest_grid_sample)
 
-        with mock.patch(
-            "rfdetr.models.heads.segmentation._nearest_grid_sample",
-            wraps=_nearest_grid_sample,
-        ) as spy:
-            point_sample(input, point_coords, mode="nearest", padding_mode=padding_mode)
+        point_sample(input, point_coords, mode="nearest", padding_mode=padding_mode)
 
         assert spy.call_count == 1
 
@@ -765,12 +833,12 @@ class TestPointSampleNearestRouting:
 
         assert torch.equal(actual, expected)
 
-    def test_unsupported_mode_still_delegates(self) -> None:
+    def test_unsupported_mode_still_delegates(self, mocker) -> None:
         """A mode the gather path does not implement must keep reaching F.grid_sample."""
         input = torch.randn(1, 1, 5, 5)
         point_coords = torch.rand(1, 4, 2)
+        spy = mocker.patch("rfdetr.models.heads.segmentation.F.grid_sample", wraps=F.grid_sample)
 
-        with mock.patch("rfdetr.models.heads.segmentation.F.grid_sample", wraps=F.grid_sample) as spy:
-            point_sample(input, point_coords, mode="bicubic")
+        point_sample(input, point_coords, mode="bicubic")
 
         assert spy.call_count == 1
