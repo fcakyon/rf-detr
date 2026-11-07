@@ -34,8 +34,8 @@ same `--name`, then score once with `--val-only` after all shards finish.
 
 ## Latency export
 
-`export_rfdetr.py` exports each variant to FP32 ONNX with RF-DETR's own exporter. Its docstring lists the ONNX
-packages.
+`export_rfdetr.py` exports each variant to FP32 ONNX with RF-DETR's own exporter, plus the FP16 cast of it that
+RF-DETR's TensorRT 11 export builds its engine from. Its docstring lists the ONNX packages.
 
 ## COCO-SAMA labels
 
