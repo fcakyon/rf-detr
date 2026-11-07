@@ -95,7 +95,6 @@ def train_run(args: argparse.Namespace, run_dir: Path) -> None:
     import rfdetr
     import torch
     from rfdetr.config import TrainConfig
-    from rfdetr.datasets.yolo import _extract_yolo_class_names
 
     class_name, resolution = VARIANTS[args.variant]
     model_class = getattr(rfdetr, class_name)
@@ -122,7 +121,7 @@ def train_run(args: argparse.Namespace, run_dir: Path) -> None:
         lock = lock_dataset(run_dir, name)  # noqa: F841, held until the next dataset
         shutil.rmtree(output_dir, ignore_errors=True)  # no args.yaml, so anything here is from an unfinished attempt
         output_dir.mkdir(parents=True)
-        model = model_class(num_classes=len(_extract_yolo_class_names(data_yamls[name])))  # XLarge pins 90 otherwise
+        model = model_class()  # train() aligns num_classes to the dataset
         source, last = Path(model.model_config.pretrain_weights), scratch / "last.ckpt"
         print(f"{name}: {data_yamls[name].parent} resolution={model.model_config.resolution} (RF-DETR defaults)")
         model.train(
