@@ -1,3 +1,9 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 import argparse
 import importlib.metadata
 import json
@@ -5,8 +11,9 @@ import re
 import sys
 from pathlib import Path
 
-import rfdetr
 import run_ul37 as runner
+
+import rfdetr
 from rfdetr.config import TrainConfig
 from rfdetr.datasets.yolo import is_valid_yolo_dataset
 
@@ -33,7 +40,12 @@ assert installed == locked, {
 assert sys.version_info[:2] == (3, 13)
 for name, resolution in runner.VARIANTS.values():
     config = getattr(rfdetr, name)().model_config
-    assert (config.resolution, config.num_queries, config.num_select) == (resolution, 300, 300), (name, config)
+    defaults = type(config).model_fields
+    assert (config.resolution, config.num_queries, config.num_select) == (
+        resolution,
+        defaults["num_queries"].default,
+        defaults["num_select"].default,
+    ), (name, config)
 TrainConfig(dataset_dir="/tmp", epochs=100, checkpoint_interval=101, **runner.TRAIN)
 
 fraction, roster, data_yamls, ultralytics_sha = runner.load_roster(args.benchmark)

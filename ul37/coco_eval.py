@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 r"""Evaluate a released RF-DETR COCO detector on COCO val2017 and score its detections.
 
 Predict resizes each image to the variant's native square resolution with an antialiased bilinear resize, the
 preprocessing of Roboflow's own benchmark (roboflow/single_artifact_benchmarking) behind the published COCO numbers,
 because `RFDETR.predict` resizes without antialiasing (roboflow/rf-detr#1516) and scores RF-DETR-N 48.0 instead of
 48.4. It then runs `RFDETR.predict` in FP32 with threshold 0 and writes a COCO results json: the postprocessor's
-top-300 detections per image, xywh boxes in original image pixels and the pretrained head's class ids, which are
+native top-k detections per image, xywh boxes in original image pixels and the pretrained head's class ids, which are
 already 91-space COCO category ids. Score evaluates that json with faster-coco-eval (bbox, default maxDets) against
 every given annotation file, which must share the image ids and categories of the first one, and prints one SCORE line
 with AP, AP50, APs, APm and APl as percentages.
@@ -27,6 +33,9 @@ import json
 from pathlib import Path
 
 VARIANTS = {
+    "atto": "RFDETRAtto",
+    "femto": "RFDETRFemto",
+    "pico": "RFDETRPico",
     "nano": "RFDETRNano",
     "small": "RFDETRSmall",
     "medium": "RFDETRMedium",
@@ -50,12 +59,12 @@ def predict(
         batch (int): Images per predict call.
         engine (Path | None): Static batch-1 TensorRT engine of the checkpoint to run instead of PyTorch.
     """
-    import rfdetr
-    import torchvision.transforms.functional as F
+    import torchvision.transforms.functional as functional
     from PIL import Image
 
+    import rfdetr
+
     model = getattr(rfdetr, VARIANTS[variant])(pretrain_weights=str(weights))
-    assert model.model_config.num_select == 300, model.model_config.num_select
     size = model.model.resolution
     if engine:  # same preprocessing and postprocessor around the engine, which carries an Ultralytics metadata header
         import tensorrt as trt
@@ -83,8 +92,8 @@ def predict(
     records = []
     for start in range(0, len(files), batch):
         chunk = files[start : start + batch]
-        tensors = [F.to_tensor(Image.open(path).convert("RGB")) for _, path in chunk]
-        resized = [F.resize(tensor, [size, size], antialias=True).clamp(0, 1) for tensor in tensors]
+        tensors = [functional.to_tensor(Image.open(path).convert("RGB")) for _, path in chunk]
+        resized = [functional.resize(tensor, [size, size], antialias=True).clamp(0, 1) for tensor in tensors]
         detections = model.predict(resized, threshold=0.0, include_source_image=False)
         for (image_id, _), tensor, result in zip(chunk, tensors, detections):
             sx, sy = tensor.shape[2] / size, tensor.shape[1] / size

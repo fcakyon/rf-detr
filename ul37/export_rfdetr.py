@@ -1,24 +1,32 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 r"""Export RF-DETR detection sizes to static batch-1 ONNX at native resolution with RF-DETR's own exporter.
 
-Usage: python export_rfdetr.py OUT_DIR [nano small medium large xlarge xxlarge]
-Each size writes the FP32 graph rf-detr-SIZE.onnx and rf-detr-SIZE.fp16.onnx, the FP16 graph RF-DETR's TensorRT 11
-export builds its engine from (`_cast_onnx_to_fp16`: a full onnxconverter-common cast with FP32 IO), and is merged into
-OUT_DIR/export_info.json.
-Run on CPU from the rf-detr checkout with its .venv plus the ONNX packages it lacks, in a scratch dir D:
-    uv pip install --python .venv/bin/python --target D --no-deps ml-dtypes==0.6.0 onnx==1.23.2 \
-        onnxconverter-common==1.16.0 protobuf==6.33.6
-    CUDA_VISIBLE_DEVICES= PYTHONPATH=D .venv/bin/python ul37/export_rfdetr.py OUT_DIR SIZE
+Usage: python export_rfdetr.py OUT_DIR [nano small medium large xlarge xxlarge] Each size writes the FP32 graph rf-detr-
+SIZE.onnx and rf-detr-SIZE.fp16.onnx, the FP16 graph RF-DETR's TensorRT 11 export builds its engine from
+(`_cast_onnx_to_fp16`: a full onnxconverter-common cast with FP32 IO), and is merged into OUT_DIR/export_info.json. Run
+on CPU from the rf-detr checkout with its .venv plus the ONNX packages it lacks, in a scratch dir D:     uv pip install
+--python .venv/bin/python --target D --no-deps ml-dtypes==0.6.0 onnx==1.23.2 \         onnxconverter-common==1.16.0
+protobuf==6.33.6     CUDA_VISIBLE_DEVICES= PYTHONPATH=D .venv/bin/python ul37/export_rfdetr.py OUT_DIR SIZE
 """
 
 import json
 import sys
 from pathlib import Path
 
-import rfdetr
 import torch
+
+import rfdetr
 from rfdetr.export._tensorrt.exporter import _cast_onnx_to_fp16
 
 SIZES = {
+    "atto": ("RFDETRAtto", 380),
+    "femto": ("RFDETRFemto", 384),
+    "pico": ("RFDETRPico", 560),
     "nano": ("RFDETRNano", 384),
     "small": ("RFDETRSmall", 512),
     "medium": ("RFDETRMedium", 576),

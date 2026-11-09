@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """Train RF-DETR on Platform-backed UL37 datasets and save canonical prediction artifacts."""
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ from ul37_common import (
 
 RUNNER_SHA256 = sha256(Path(__file__))  # at import: the code this process runs, even if redeployed under it
 VARIANTS = {  # RF-DETR class and native resolution, word variants slug to their first letter (nano -> n)
+    "atto": ("RFDETRAtto", 380),
+    "femto": ("RFDETRFemto", 384),
+    "pico": ("RFDETRPico", 560),
     "nano": ("RFDETRNano", 384),
     "small": ("RFDETRSmall", 512),
     "medium": ("RFDETRMedium", 576),
@@ -59,7 +68,7 @@ def save_predictions(model, images: list[Path], output: Path, batch_size: int) -
     Images are resized with antialiasing before predict, as the torchvision training transforms do, because predict
     resizes without it (roboflow/rf-detr#1516).
     """
-    import torchvision.transforms.functional as F
+    import torchvision.transforms.functional as functional
     from PIL import Image
 
     num_classes, size = model.model_config.num_classes, model.model.resolution
@@ -68,8 +77,8 @@ def save_predictions(model, images: list[Path], output: Path, batch_size: int) -
         batch = images[start : start + batch_size]
         resized, scales = [], []
         for path in batch:
-            tensor = F.to_tensor(Image.open(path).convert("RGB"))
-            resized.append(F.resize(tensor, [size, size], antialias=True).clamp(0, 1))
+            tensor = functional.to_tensor(Image.open(path).convert("RGB"))
+            resized.append(functional.resize(tensor, [size, size], antialias=True).clamp(0, 1))
             scales.append([tensor.shape[2] / size, tensor.shape[1] / size] * 2)
         detections = model.predict(resized, threshold=0.0, include_source_image=False)
         for path, scale, result in zip(batch, scales, detections):
@@ -92,8 +101,9 @@ def train_run(args: argparse.Namespace, run_dir: Path) -> None:
     """Train every selected dataset without args.yaml, then predict from its best checkpoint."""
     fraction, datasets, data_yamls, ultralytics_sha = load_roster(args.benchmark)
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device.removeprefix("cuda:")
-    import rfdetr
     import torch
+
+    import rfdetr
     from rfdetr.config import TrainConfig
 
     class_name, resolution = VARIANTS[args.variant]
